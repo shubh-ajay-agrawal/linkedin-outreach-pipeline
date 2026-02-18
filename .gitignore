@@ -1,0 +1,7 @@
+.env
+venv/
+__pycache__/
+*.pyc
+enrichment_log.csv
+test_pipeline.py
+test_pipeline_100.py

@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(lsof:*)",
+      "Bash(curl:*)",
+      "Bash(pkill:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "WebSearch",
+      "WebFetch(domain:prospeo.io)",
+      "WebFetch(domain:help.prospeo.io)",
+      "WebFetch(domain:developer.instantly.ai)",
+      "Bash(gh auth:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)"
+    ]
+  }
+}
