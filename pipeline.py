@@ -137,8 +137,14 @@ def _phantombuster_poll(container_id: str) -> dict:
         resp.raise_for_status()
         data = resp.json()
 
+        response_container = data.get("containerId")
         status = data.get("status")
-        _log(f"PhantomBuster status: {status} (elapsed {elapsed}s)")
+        _log(f"PhantomBuster status: {status}, container: {response_container} (elapsed {elapsed}s)")
+
+        # Ignore results from a previous run — keep waiting for OUR run
+        if response_container != container_id:
+            _log(f"Waiting — output is from old run ({response_container}), not ours ({container_id})")
+            continue
 
         if status == "finished":
             return data
