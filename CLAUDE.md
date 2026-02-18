@@ -107,6 +107,23 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
   - Title filter kept 19 decision-makers, dropped 33
   - All 19 leads successfully pushed to Instantly "Claudecode_experimental" campaign
   - Slack summary message sent to `#linkedin-scraper`
+- **Deployed to Railway on 2026-02-19:**
+  - GitHub repo created: `https://github.com/shubh-ajay-agrawal/linkedin-outreach-pipeline`
+  - Code pushed to GitHub, Railway auto-deploys from it
+  - Railway project: "dependable-nourishment" / production
+  - Railway public URL: `https://web-production-e430.up.railway.app`
+  - Health check verified: `/health` returns `{"status":"ok"}`
+  - All 5 environment variables added to Railway (PHANTOMBUSTER_API_KEY, PROSPEO_API_KEY, INSTANTLY_API_KEY, SLACK_BOT_TOKEN, SLACK_SIGNING_SECRET)
+  - Deployment status: ACTIVE / Online
+- **Slack Events API connected on 2026-02-19:**
+  - Request URL set to: `https://web-production-e430.up.railway.app/slack/events`
+  - URL verification: passed (green checkmark)
+  - Bot event subscription added: `message.channels`
+  - Bot was already in `#linkedin-scraper` channel from prior local testing
+- **First Railway pipeline run triggered on 2026-02-19:**
+  - Shubh pasted a LinkedIn post URL in `#linkedin-scraper`
+  - Pipeline started on Railway (visible in Railway logs)
+  - Ran against old Dima Bilous data (941 profiles) due to PhantomBuster container ID bug (see bug #8 below) — this is fine, Shubh confirmed he's OK using that data
 
 ### Bugs found and fixed during testing:
 1. **Python 3.9 compatibility** — `dict | None` type hint changed to `Optional[dict]` (Mac has Python 3.9)
@@ -116,11 +133,23 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 5. **Prospeo API migration** — Old endpoints (`/linkedin-email-finder`, `/email-finder`) are dead. New endpoint is `/enrich-person` with `{"only_verified_email": true, "data": {"linkedin_url": "..."}}`. Response structure is `{"person": {...}, "company": {...}}`.
 6. **Prospeo API key** — Original key was wrong. Correct key is the "CC pirpleine" key from Prospeo dashboard.
 7. **Instantly `campaign` vs `campaign_id`** — The v2 API field is `campaign`, NOT `campaign_id`. Using `campaign_id` silently adds leads to workspace without linking to the campaign.
+8. **PhantomBuster polling used old results** — The `_phantombuster_poll` function checked agent status but never verified the `containerId` matched the run we launched. If a previous run was already "finished", the poll would immediately return OLD results instead of waiting for the new run. **Fixed on 2026-02-19:** poll now compares `containerId` in the response to the one returned by launch, and ignores results from old runs.
 
-### NOT DONE YET:
-1. **Deploy to Railway** — push code so it runs 24/7 on the internet
-2. **Connect Slack Events API to Railway URL** — tell Slack where the app lives so posting a URL in `#linkedin-scraper` triggers the pipeline automatically
-3. **Full production test** — paste a LinkedIn post URL in Slack and watch the entire flow work end-to-end via Slack (not just local test)
+### Code improvements added on 2026-02-19 (committed, NOT yet pushed to GitHub):
+- **Acknowledgment message** — When the pipeline starts, it immediately sends a Slack message: "Got it! Starting the pipeline..." so Shubh knows the bot received the URL and is working.
+- **Container ID check** — PhantomBuster polling now verifies it's looking at results from the correct run (bug #8 fix above).
+
+### FIRST THING TO DO NEXT SESSION:
+1. **Push the latest code to GitHub** — there are 2 committed fixes that haven't been pushed yet. Open Terminal and run:
+   ```
+   cd ~/linkedin-outreach-pipeline && git push
+   ```
+   Railway will auto-redeploy with the new code.
+2. **Wait for Railway to redeploy** — takes about 1 minute. Check Railway dashboard for green "Active" status.
+3. **Run a proper production test** — paste a NEW LinkedIn post URL in `#linkedin-scraper` and verify:
+   - You get the "Got it!" acknowledgment message immediately
+   - PhantomBuster scrapes the NEW post (not old data)
+   - Full pipeline completes and summary appears in Slack
 4. **Clean up test data** — remove test leads (test-debug@example.com, test-camp2@example.com, verify-campaign-test@example.com) from Instantly campaign
 
 ### Test files (can be deleted after deployment):
