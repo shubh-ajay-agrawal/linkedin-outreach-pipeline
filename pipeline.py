@@ -338,6 +338,11 @@ def run_pipeline(post_url: str):
     """Execute the full pipeline for a given LinkedIn post URL."""
     start = time.time()
     _log(f"Pipeline started for {post_url}")
+    _send_slack_message(
+        f"\U0001f4e1 Got it! Starting the pipeline for:\n{post_url}\n\n"
+        f"PhantomBuster is scraping engagers now — this usually takes 5-15 minutes. "
+        f"I'll send you a full summary when it's done."
+    )
 
     # ---- Step 2: PhantomBuster ----
     try:
