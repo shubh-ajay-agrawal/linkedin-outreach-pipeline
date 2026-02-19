@@ -82,6 +82,9 @@ def slack_events():
         post_url = match.group(0)
         # Strip trailing angle bracket if Slack auto-wrapped the URL
         post_url = post_url.rstrip(">")
+        # Slack formats links as <URL|display_text> — strip the display part
+        if "|" in post_url:
+            post_url = post_url.split("|")[0]
         # Run pipeline in background thread so we respond to Slack within 3 seconds
         thread = threading.Thread(target=run_pipeline, args=(post_url,), daemon=True)
         thread.start()

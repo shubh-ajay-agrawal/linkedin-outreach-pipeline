@@ -97,20 +97,18 @@ def _phantombuster_launch(post_url: str) -> str:
     saved_argument["postEngagersToExtract"] = ["likers", "commenters"]
     _log(f"PhantomBuster argument after merge: linkedinPostUrl={post_url}, companyUrl={post_url}")
 
-    # Step C: Save the merged config back AND disable auto-launch
-    # (we only want it to run when triggered from Slack, not on a schedule)
+    # Step C: Save the merged config back
     save_resp = requests.post(
         f"{PB_BASE}/agents/save",
         headers=headers,
         json={
             "id": PHANTOM_ID,
             "argument": saved_argument,
-            "launchType": "manual",
         },
         timeout=30,
     )
     save_resp.raise_for_status()
-    _log(f"PhantomBuster config saved (URL + manual launch mode)")
+    _log(f"PhantomBuster config saved with new post URL")
 
     # Step D: Launch the phantom (uses saved config)
     resp = requests.post(
