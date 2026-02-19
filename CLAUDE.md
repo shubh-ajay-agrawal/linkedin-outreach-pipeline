@@ -128,29 +128,125 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 ### Bugs found and fixed during testing:
 1. **Python 3.9 compatibility** — `dict | None` type hint changed to `Optional[dict]` (Mac has Python 3.9)
 2. **PhantomBuster Phantom ID** — was wrong (`5251160215300729`), updated to `5647257991330907`
-3. **PhantomBuster launch method** — cannot just pass `argument` in launch call. Must: (a) fetch saved config, (b) merge in new post URL + engager types, (c) save via `/agents/save`, (d) then launch. The `argument` field names are `linkedinPostUrl` and `postEngagersToExtract` (array: `["likers", "commenters"]`).
+3. **PhantomBuster launch method** — Originally thought you cannot pass `argument` in launch call, but Swagger spec confirms you CAN pass `argument` or `bonusArgument` directly in the launch call. However, using save-then-launch is still valid. The relevant argument fields are `linkedinPostUrl`, `companyUrl`, `inputType`, `postEngagersToExtract`, `sessionCookie`, `userAgent`, and optionally `postsPublishedFromDate`.
 4. **PhantomBuster CSV parsing** — `resultObject` is always null. Results are in a CSV on S3. URL must be extracted via regex from the `output` (console log) field. Also, the profile URL column is `profileLink` (941 rows) not `profileUrl` (only 50 rows).
 5. **Prospeo API migration** — Old endpoints (`/linkedin-email-finder`, `/email-finder`) are dead. New endpoint is `/enrich-person` with `{"only_verified_email": true, "data": {"linkedin_url": "..."}}`. Response structure is `{"person": {...}, "company": {...}}`.
 6. **Prospeo API key** — Original key was wrong. Correct key is the "CC pirpleine" key from Prospeo dashboard.
 7. **Instantly `campaign` vs `campaign_id`** — The v2 API field is `campaign`, NOT `campaign_id`. Using `campaign_id` silently adds leads to workspace without linking to the campaign.
 8. **PhantomBuster polling used old results** — The `_phantombuster_poll` function checked agent status but never verified the `containerId` matched the run we launched. If a previous run was already "finished", the poll would immediately return OLD results instead of waiting for the new run. **Fixed on 2026-02-19:** poll now compares `containerId` in the response to the one returned by launch, and ignores results from old runs.
 
-### Code improvements added on 2026-02-19 (committed, NOT yet pushed to GitHub):
-- **Acknowledgment message** — When the pipeline starts, it immediately sends a Slack message: "Got it! Starting the pipeline..." so Shubh knows the bot received the URL and is working.
-- **Container ID check** — PhantomBuster polling now verifies it's looking at results from the correct run (bug #8 fix above).
+### Code changes pushed to GitHub on 2026-02-19 (all deployed to Railway):
+- **Acknowledgment message** — When the pipeline starts, it immediately sends a Slack message: "Got it! Starting the pipeline..." so Shubh knows the bot received the URL and is working. ✅ WORKING
+- **Container ID check** — PhantomBuster polling now verifies it's looking at results from the correct run (bug #8 fix above). ✅ PUSHED
+- **`companyUrl` field fix** — pipeline.py now updates BOTH `linkedinPostUrl` AND `companyUrl` in PhantomBuster config (see bug #9 below). ✅ PUSHED
+- **Slack URL cleanup** — main.py now strips Slack's `|display_text` from URLs. Slack wraps links as `<url|display_text>` and the old regex captured both parts, creating a mangled double-URL. ✅ PUSHED
+
+### Bugs found and fixed on 2026-02-19 (session 2):
+9. **PhantomBuster `companyUrl` vs `linkedinPostUrl`** — Our code was only updating `linkedinPostUrl`, but PhantomBuster also uses `companyUrl`. Now we update BOTH. However, this alone did NOT fix the scraping issue — see bug #10.
+10. **Slack URL pipe separator** — Slack formats links as `<actual_url|display_text>`. Our regex captured everything including the `|display_text`, sending a mangled URL to PhantomBuster (two URLs glued together with `|`). Fixed by splitting on `|` and taking only the first part.
+11. **PhantomBuster `launchType` values** — The save endpoint accepts `"manually"` (not `"manual"`) and `"repeatedly"` (not `"automatic"`). Using wrong values causes 400 errors. Also, setting `launchType: "manually"` STOPS the phantom — it can't be launched via API in that state. The phantom MUST have `launchType: "repeatedly"` for API launches to work (PhantomBuster quirk).
+
+### CRITICAL UNSOLVED BUG — PhantomBuster won't scrape new URLs:
+
+**The #1 problem:** PhantomBuster keeps returning old cached data (941 profiles from the original Dima Bilous test post) instead of scraping whatever new URL Shubh pastes in Slack.
+
+**Root cause investigation done on 2026-02-19:**
+We dug deep into the PhantomBuster API and discovered multiple issues:
+
+1. **The phantom has an `inputType` field** that tells it what mode to operate in. Valid values: `"linkedinPostUrl"`, `"linkedinCompanyUrl"`, `"linkedinProfileUrl"`, `"linkedinPostSearch"`. Our saved config was MISSING this field. We discovered this by fetching the phantom script's manifest via `/api/v2/scripts/fetch?id=5251160215300729`.
+
+2. **When `inputType` is set, `postsPublishedFromDate` becomes required.** Setting `inputType: "linkedinPostUrl"` without `postsPublishedFromDate` causes: `"Error: the Phantom Configuration is invalid: must have required property 'postsPublishedFromDate'"`. Set `shouldOnlyRetrievePostsPublishedFromDate: false` and `postsPublishedFromDate: "01-01-2020"` to satisfy this.
+
+3. **`fileMgmt: "mix"` (default) caches old results** — The phantom's result CSV accumulates data across ALL runs. Even after changing the URL, the old 941 profiles persist in the CSV. When the phantom runs, it re-exports these cached results without actually scraping LinkedIn. Setting `fileMgmt: "delete"` clears old CSV data, but the phantom STILL doesn't scrape — it just saves empty results and exits in ~9 seconds.
+
+4. **The phantom has an internal leads database** (visible in the PhantomBuster dashboard "Leads" tab) that stores all 941 leads separately from the CSV. This is NOT the same as PhantomBuster's org-storage API (we checked — 0 leads found via org-storage for this phantom ID). The leads tab shows all the old Dima Bilous profiles. This internal database may be what prevents re-scraping.
+
+5. **The PhantomBuster launch API supports `bonusArgument`** — a one-time argument override that gets merged with the saved argument. We discovered this from the Swagger spec at `github.com/phantombuster/public-gists/master/swagger-api-v2.json`. Passing `bonusArgument` with `inputType` in the launch call DID cause the phantom to read our argument (we could see it printed in the console output), but it still didn't scrape.
+
+**What was tried and the results:**
+
+| Attempt | Result |
+|---|---|
+| Update `linkedinPostUrl` only via `/agents/save` | URL saved correctly, phantom ignored it, returned old 941 profiles |
+| Update BOTH `linkedinPostUrl` + `companyUrl` via `/agents/save` | Both saved correctly (verified by re-fetching), phantom still returned old 941 profiles |
+| Set `fileMgmt: "delete"` to clear cached CSV | Old CSV cleared, but phantom saved EMPTY results (0 profiles) — didn't actually scrape LinkedIn |
+| Set `fileMgmt: "delete"` + pass `inputType: "linkedinPostUrl"` via `bonusArgument` | Phantom printed the argument in console (confirmed it's reading it), but threw error: missing `postsPublishedFromDate` |
+| Add `postsPublishedFromDate` + `shouldOnlyRetrievePostsPublishedFromDate: false` | Phantom stopped throwing error, but still didn't scrape — finished in ~9 seconds with 0 profiles |
+| Save full argument with all fields via `/agents/save` + launch | (Was about to try this when session ended) |
+
+**PhantomBuster API field reference (from Swagger spec):**
+
+Launch endpoint (`/agents/launch`) accepts:
+- `id` — phantom ID
+- `argument` — full argument (JSON string or object), overrides saved argument for this run
+- `bonusArgument` — one-time merge on top of saved argument
+- `saveArgument` — boolean, if true saves the argument permanently
+- `manualLaunch` — boolean
+
+Save endpoint (`/agents/save`) accepts:
+- `id`, `argument`, `fileMgmt` (`"folders"`, `"mix"`, `"delete"`), `launchType` (`"manually"`, `"repeatedly"`, `"once"`, `"after agent"`), `name`, `notifications`, etc.
+
+Script argument schema (from `/api/v2/scripts/fetch?id=5251160215300729`):
+- `inputType` — enum: `["linkedinCompanyUrl", "linkedinProfileUrl", "linkedinPostUrl", "linkedinPostSearch"]`
+- `companyUrl` — the primary URL field (shown as "Enter the LinkedIn URL to scrape" in UI)
+- `linkedinPostUrl` — URL field for single post mode
+- `linkedinCompanyUrl` — URL field for company mode
+- `linkedinProfileUrl` — URL field for profile mode
+- `sessionCookie` — LinkedIn session cookie
+- `userAgent` — browser user agent
+- `postEngagersToExtract` — array: `["commenters", "likers"]`
+- `shouldOnlyRetrievePostsPublishedFromDate` — boolean
+- `postsPublishedFromDate` — string, format `"MM-DD-YYYY"`
+- `excludeOwnProfileFromResult` — boolean
+- `pushResultToCRM` — boolean
+
+**Current state of the phantom (as of end of session 2026-02-19):**
+- `fileMgmt` is set to `"delete"` (was changed during debugging)
+- `launchType` is `"repeatedly"` (auto-launch ON — required for API launches)
+- The saved argument has BOTH `linkedinPostUrl` and `companyUrl` set to Shubh's test post URL
+- The ON/OFF toggle in the PhantomBuster dashboard is ON
+- The phantom's "Leads" tab still shows the old 941 profiles from the Dima Bilous post
+- The result CSV is currently empty (cleared by fileMgmt=delete)
 
 ### FIRST THING TO DO NEXT SESSION:
-1. **Push the latest code to GitHub** — there are 2 committed fixes that haven't been pushed yet. Open Terminal and run:
-   ```
-   cd ~/linkedin-outreach-pipeline && git push
-   ```
-   Railway will auto-redeploy with the new code.
-2. **Wait for Railway to redeploy** — takes about 1 minute. Check Railway dashboard for green "Active" status.
-3. **Run a proper production test** — paste a NEW LinkedIn post URL in `#linkedin-scraper` and verify:
-   - You get the "Got it!" acknowledgment message immediately
-   - PhantomBuster scrapes the NEW post (not old data)
-   - Full pipeline completes and summary appears in Slack
-4. **Clean up test data** — remove test leads (test-debug@example.com, test-camp2@example.com, verify-campaign-test@example.com) from Instantly campaign
+
+**The PhantomBuster scraping problem is the ONLY blocker.** Everything else works (Slack bot, Prospeo, title filter, Instantly push, Slack summary). Fix this one thing and the pipeline is fully operational.
+
+**Approach 1 — Try the full argument in launch call (most promising, was about to test):**
+```python
+# Save complete argument with inputType and all required fields
+new_arg = {
+    'sessionCookie': '<keep existing>',
+    'userAgent': '<keep existing>',
+    'inputType': 'linkedinPostUrl',
+    'linkedinPostUrl': NEW_URL,
+    'companyUrl': NEW_URL,
+    'postEngagersToExtract': ['likers', 'commenters'],
+    'shouldOnlyRetrievePostsPublishedFromDate': False,
+    'postsPublishedFromDate': '01-01-2020',
+    'excludeOwnProfileFromResult': True,
+    'pushResultToCRM': False,
+}
+# Then launch with argument= and saveArgument=True
+```
+
+**Approach 2 — Clear the phantom's internal leads database:**
+The "Leads" tab in PhantomBuster dashboard still has 941 old profiles. These might be preventing the phantom from re-scraping. Ask Shubh to manually delete all leads from the phantom's Leads tab in the PhantomBuster UI, THEN try launching. There is NO API endpoint to clear these leads (the org-storage API returned 0 for this phantom).
+
+**Approach 3 — Create a brand new phantom:**
+If the old phantom is too polluted with cached data, create a fresh "LinkedIn Post Commenter and Liker Scraper" phantom through the PhantomBuster UI, connect Shubh's LinkedIn, and use the new phantom ID. Then update `PHANTOM_ID` in pipeline.py.
+
+**Approach 4 — Set `fileMgmt` back to `"mix"` and don't pass `inputType`:**
+The original phantom worked WITHOUT `inputType` in the argument. Maybe the script's default mode (when `inputType` is missing) knows how to handle `companyUrl`. With `fileMgmt: "delete"` AND no old cached data (after clearing leads), the phantom might scrape fresh. The key is that `inputType` might be changing the script's behavior in unexpected ways.
+
+**After fixing PhantomBuster, update the pipeline code:**
+Once we know the correct way to launch the phantom (which fields, which API params), update `_phantombuster_launch()` in `pipeline.py` to use the working approach. The current code only sets `linkedinPostUrl` and `companyUrl` — it may also need `inputType`, `postsPublishedFromDate`, `bonusArgument` in launch, `fileMgmt: "delete"`, etc.
+
+**Also don't forget:**
+- Set `fileMgmt` back to `"mix"` or `"delete"` as appropriate after testing
+- The auto-launch schedule (once daily at 12:17 AM IST) is still active — consider disabling after pipeline works, OR leave it since it won't cause harm if there's no new data
+- Clean up test data from Instantly campaign
+- Test the full end-to-end flow from Slack (not just the PhantomBuster step)
 
 ### Test files (can be deleted after deployment):
 - `test_pipeline.py` — basic pipeline test script
