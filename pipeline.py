@@ -29,7 +29,7 @@ PB_MAX_POLL_TIME = 30 * 60    # 30 minutes
 
 # Prospeo
 PROSPEO_BASE = "https://api.prospeo.io"
-PROSPEO_DELAY = 0.5           # seconds between calls (rate limit: 30/sec)
+PROSPEO_DELAY = 0.5           # seconds between enrichment calls (limit is 30/sec, we use 2/sec)
 
 # Instantly v2
 INSTANTLY_BASE = "https://api.instantly.ai/api/v2"
