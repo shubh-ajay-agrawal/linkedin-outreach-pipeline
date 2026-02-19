@@ -17,13 +17,14 @@ from title_filter import filter_leads
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-PHANTOM_ID = "5647257991330907"
+PHANTOM_LIKERS_ID = "7700895230156471"
+PHANTOM_COMMENTERS_ID = "6672845611180416"
 INSTANTLY_CAMPAIGN_ID = "75654875-36a1-4565-a47a-fcff4426a442"
 ENRICHMENT_LOG = "enrichment_log.csv"
 
 # PhantomBuster
 PB_BASE = "https://api.phantombuster.com/api/v2"
-PB_POLL_INTERVAL = 120        # seconds between status checks
+PB_POLL_INTERVAL = 30         # seconds between status checks (shorter — simple phantoms are faster)
 PB_MAX_POLL_TIME = 30 * 60    # 30 minutes
 
 # Prospeo
@@ -68,63 +69,72 @@ def _send_error(step: str, error: str, post_url: str):
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — PhantomBuster: launch, poll, fetch results
+# Step 2 — PhantomBuster: launch BOTH phantoms, poll, fetch & merge results
 # ---------------------------------------------------------------------------
 
-def _phantombuster_launch(post_url: str) -> str:
-    """Launch the phantom and return the container ID."""
+def _phantombuster_launch_one(phantom_id: str, label: str, post_url: str) -> str:
+    """Launch a single phantom with the given post URL. Returns container ID."""
+    import json as _json
     api_key = os.environ["PHANTOMBUSTER_API_KEY"]
     headers = {"X-Phantombuster-Key": api_key, "Content-Type": "application/json"}
 
-    # Step A: Fetch the phantom's current saved arguments (sessionCookie, etc.)
+    # Fetch current saved argument (to keep sessionCookie + userAgent)
     fetch_resp = requests.get(
         f"{PB_BASE}/agents/fetch",
         headers={"X-Phantombuster-Key": api_key},
-        params={"id": PHANTOM_ID},
+        params={"id": phantom_id},
         timeout=30,
     )
     fetch_resp.raise_for_status()
-    saved_argument = fetch_resp.json().get("argument", {})
-    if isinstance(saved_argument, str):
-        import json as _json
-        saved_argument = _json.loads(saved_argument)
+    saved_arg = fetch_resp.json().get("argument", {})
+    if isinstance(saved_arg, str):
+        saved_arg = _json.loads(saved_arg)
 
-    # Step B: Merge in our overrides (post URL + engager types)
-    # PhantomBuster uses BOTH fields — companyUrl is the one the phantom
-    # actually reads when deciding which post to scrape.
-    saved_argument["linkedinPostUrl"] = post_url
-    saved_argument["companyUrl"] = post_url
-    saved_argument["postEngagersToExtract"] = ["likers", "commenters"]
-    _log(f"PhantomBuster argument after merge: linkedinPostUrl={post_url}, companyUrl={post_url}")
+    # Build the launch argument — keep session cookie, set the post URL
+    launch_arg = {
+        "postUrl": post_url,
+        "sessionCookie": saved_arg.get("sessionCookie", ""),
+        "userAgent": saved_arg.get("userAgent", ""),
+        "numberOfPostsPerLaunch": 1,
+        "csvName": "result",
+        "watcherMode": False,
+        "excludeOwnProfileFromResult": True,
+    }
 
-    # Step C: Save the merged config back
-    save_resp = requests.post(
-        f"{PB_BASE}/agents/save",
-        headers=headers,
-        json={
-            "id": PHANTOM_ID,
-            "argument": saved_argument,
-        },
-        timeout=30,
-    )
-    save_resp.raise_for_status()
-    _log(f"PhantomBuster config saved with new post URL")
+    _log(f"Launching {label} phantom ({phantom_id}) for {post_url}")
 
-    # Step D: Launch the phantom (uses saved config)
     resp = requests.post(
         f"{PB_BASE}/agents/launch",
         headers=headers,
-        json={"id": PHANTOM_ID},
+        json={
+            "id": phantom_id,
+            "argument": launch_arg,
+            "saveArgument": False,
+        },
         timeout=30,
     )
     resp.raise_for_status()
     container_id = resp.json().get("containerId")
-    _log(f"PhantomBuster launched — container {container_id}")
+    _log(f"{label} phantom launched — container {container_id}")
     return container_id
 
 
-def _phantombuster_poll(container_id: str) -> dict:
-    """Poll until the phantom finishes or we time out. Returns the agent object."""
+def _phantombuster_launch(post_url: str) -> dict:
+    """Launch both likers and commenters phantoms. Returns dict of container IDs."""
+    likers_container = _phantombuster_launch_one(
+        PHANTOM_LIKERS_ID, "Likers", post_url
+    )
+    commenters_container = _phantombuster_launch_one(
+        PHANTOM_COMMENTERS_ID, "Commenters", post_url
+    )
+    return {
+        "likers": {"phantom_id": PHANTOM_LIKERS_ID, "container_id": likers_container},
+        "commenters": {"phantom_id": PHANTOM_COMMENTERS_ID, "container_id": commenters_container},
+    }
+
+
+def _phantombuster_poll_one(phantom_id: str, container_id: str, label: str) -> dict:
+    """Poll a single phantom until it finishes. Returns the output data."""
     api_key = os.environ["PHANTOMBUSTER_API_KEY"]
     elapsed = 0
 
@@ -135,7 +145,7 @@ def _phantombuster_poll(container_id: str) -> dict:
         resp = requests.get(
             f"{PB_BASE}/agents/fetch-output",
             headers={"X-Phantombuster-Key": api_key},
-            params={"id": PHANTOM_ID},
+            params={"id": phantom_id},
             timeout=30,
         )
         resp.raise_for_status()
@@ -143,81 +153,67 @@ def _phantombuster_poll(container_id: str) -> dict:
 
         response_container = data.get("containerId")
         status = data.get("status")
-        _log(f"PhantomBuster status: {status}, container: {response_container} (elapsed {elapsed}s)")
+        _log(f"{label} status: {status}, container: {response_container} (elapsed {elapsed}s)")
 
-        # Ignore results from a previous run — keep waiting for OUR run
         if response_container != container_id:
-            _log(f"Waiting — output is from old run ({response_container}), not ours ({container_id})")
+            _log(f"Waiting — {label} output is from old run, not ours")
             continue
 
         if status == "finished":
             return data
         if status in ("error", "stopped"):
-            raise RuntimeError(f"Phantom ended with status: {status}")
+            raise RuntimeError(f"{label} phantom ended with status: {status}")
 
-    raise TimeoutError("PhantomBuster did not finish within 30 minutes")
+    raise TimeoutError(f"{label} phantom did not finish within 30 minutes")
 
 
-def _phantombuster_parse_results(data: dict) -> list[str]:
-    """Extract LinkedIn profile URLs from the phantom output."""
+def _phantombuster_poll(containers: dict) -> dict:
+    """Poll both phantoms until both finish. Returns dict with both outputs."""
+    results = {}
+    for label, info in containers.items():
+        data = _phantombuster_poll_one(
+            info["phantom_id"], info["container_id"], label.capitalize()
+        )
+        results[label] = data
+    return results
+
+
+def _phantombuster_parse_results(all_data: dict) -> list[str]:
+    """Extract and deduplicate LinkedIn profile URLs from both phantom outputs."""
     import io
     import re
 
-    # Strategy 1: Try resultObject (JSON data directly from PhantomBuster)
-    result_object = data.get("resultObject")
-    if result_object:
-        if isinstance(result_object, str):
-            import json as _json
-            result_object = _json.loads(result_object)
-        if isinstance(result_object, list):
-            urls = []
-            for entry in result_object:
-                url = ""
-                if isinstance(entry, dict):
-                    url = entry.get("profileUrl") or entry.get("linkedInProfileUrl") or entry.get("url", "")
-                elif isinstance(entry, str):
-                    url = entry
+    all_urls = []
+
+    for label, data in all_data.items():
+        output_text = data.get("output", "")
+        csv_match = re.search(
+            r'(https://phantombuster\.s3\.amazonaws\.com/[^\s]+\.csv)', output_text
+        )
+        if csv_match:
+            csv_url = csv_match.group(1)
+            _log(f"Fetching {label} results from CSV: {csv_url}")
+            resp = requests.get(csv_url, timeout=60)
+            resp.raise_for_status()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            count = 0
+            for row in reader:
+                url = (row.get("profileLink") or row.get("profileUrl") or "")
                 if url and "linkedin.com" in url:
-                    urls.append(url)
-            if urls:
-                return urls
+                    all_urls.append(url)
+                    count += 1
+            _log(f"{label}: {count} profiles found in CSV")
 
-    # Strategy 2: Extract the S3 CSV URL from the console output log
-    output_text = data.get("output", "")
-    csv_match = re.search(r'(https://phantombuster\.s3\.amazonaws\.com/[^\s]+\.csv)', output_text)
-    if csv_match:
-        csv_url = csv_match.group(1)
-        _log(f"Fetching results from CSV: {csv_url}")
-        resp = requests.get(csv_url, timeout=60)
-        resp.raise_for_status()
-        reader = csv.DictReader(io.StringIO(resp.text))
-        urls = []
-        for row in reader:
-            url = (row.get("profileLink") or row.get("profileUrl")
-                   or row.get("linkedInProfileUrl") or row.get("url") or "")
-            if "linkedin.com" in url:
-                urls.append(url)
-        return urls
+    # Deduplicate while preserving order
+    seen = set()
+    unique_urls = []
+    for url in all_urls:
+        if url not in seen:
+            seen.add(url)
+            unique_urls.append(url)
 
-    # Strategy 3: Try the JSON URL from console output
-    json_match = re.search(r'(https://phantombuster\.s3\.amazonaws\.com/[^\s]+\.json)', output_text)
-    if json_match:
-        json_url = json_match.group(1)
-        _log(f"Fetching results from JSON: {json_url}")
-        resp = requests.get(json_url, timeout=60)
-        resp.raise_for_status()
-        import json as _json
-        results = _json.loads(resp.text)
-        if isinstance(results, list):
-            urls = []
-            for entry in results:
-                if isinstance(entry, dict):
-                    url = entry.get("profileUrl") or entry.get("linkedInProfileUrl") or entry.get("url", "")
-                    if url and "linkedin.com" in url:
-                        urls.append(url)
-            return urls
-
-    return []
+    _log(f"Total unique profiles after dedup: {len(unique_urls)} (from {len(all_urls)} total)")
+    return unique_urls
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +350,15 @@ def run_pipeline(post_url: str):
         f"I'll send you a full summary when it's done."
     )
 
-    # ---- Step 2: PhantomBuster ----
+    # ---- Step 2: PhantomBuster (likers + commenters in parallel) ----
     try:
-        container_id = _phantombuster_launch(post_url)
+        containers = _phantombuster_launch(post_url)
     except Exception as exc:
         _send_error("PHANTOMBUSTER LAUNCH", str(exc), post_url)
         return
 
     try:
-        pb_data = _phantombuster_poll(container_id)
+        pb_data = _phantombuster_poll(containers)
     except Exception as exc:
         _send_error("PHANTOMBUSTER POLL", str(exc), post_url)
         return
