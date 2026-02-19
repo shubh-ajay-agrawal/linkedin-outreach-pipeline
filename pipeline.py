@@ -29,7 +29,7 @@ PB_MAX_POLL_TIME = 30 * 60    # 30 minutes
 
 # Prospeo
 PROSPEO_BASE = "https://api.prospeo.io"
-PROSPEO_DELAY = 2             # seconds between calls
+PROSPEO_DELAY = 0.5           # seconds between calls (rate limit: 30/sec)
 
 # Instantly v2
 INSTANTLY_BASE = "https://api.instantly.ai/api/v2"
@@ -412,9 +412,8 @@ def run_pipeline(post_url: str):
                 "status": f"error: {exc}",
             })
 
-        # Rate limit: 2s between Prospeo calls + 5s between profiles
         if i < total_scraped - 1:
-            time.sleep(5)
+            time.sleep(PROSPEO_DELAY)
 
     # Write enrichment log
     try:
