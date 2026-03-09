@@ -250,6 +250,7 @@ def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[d
                 }
             }
         },
+        "page": 0,
         "size": len(linkedin_urls),
         "webhook": webhook_url,
     }
@@ -260,6 +261,8 @@ def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[d
         json=payload,
         timeout=60,
     )
+    if not resp.ok:
+        _log(f"Ark AI export error — HTTP {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     body = resp.json()
 
