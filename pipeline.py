@@ -326,6 +326,32 @@ def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[d
             except Exception as exc:
                 _log(f"Statistics poll error (non-fatal): {exc}")
 
+        # Check if webhook arrived
+        with _ark_lock:
+            webhook_data = _ark_results.get(track_id)
+
+        # If webhook didn't arrive, try resending it
+        if webhook_data is None:
+            _log(f"Batch {batch_num} webhook not received — requesting resend...")
+            try:
+                resend_resp = requests.patch(
+                    f"{ARK_BASE}/people/notify",
+                    headers=headers,
+                    json={"trackId": track_id, "webhook": webhook_url},
+                    timeout=30,
+                )
+                _log(f"Resend response: HTTP {resend_resp.status_code} — {resend_resp.text}")
+            except Exception as exc:
+                _log(f"Resend request failed: {exc}")
+
+            # Wait up to 3 more minutes for the resent webhook
+            _log(f"Waiting up to 3 more minutes for resent webhook...")
+            resend_wait = 0
+            while resend_wait < 180:
+                if event.wait(timeout=ARK_POLL_INTERVAL):
+                    break
+                resend_wait += ARK_POLL_INTERVAL
+
         # Retrieve results for this batch
         with _ark_lock:
             webhook_data = _ark_results.pop(track_id, None)
@@ -333,8 +359,8 @@ def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[d
 
         if webhook_data is None:
             raise TimeoutError(
-                f"Ark AI webhook not received within {ARK_WEBHOOK_TIMEOUT // 60} minutes "
-                f"for batch {batch_num} (trackId {track_id})"
+                f"Ark AI webhook not received for batch {batch_num} (trackId {track_id}) "
+                f"even after resend request"
             )
 
         batch_leads = _parse_ark_results(webhook_data)
