@@ -6,9 +6,9 @@ Triggered when a LinkedIn post URL is detected in #linkedin-scraper.
 
 import csv
 import os
+import threading
 import time
 from datetime import datetime
-from typing import Optional
 
 import requests
 
@@ -27,9 +27,10 @@ PB_BASE = "https://api.phantombuster.com/api/v2"
 PB_POLL_INTERVAL = 30         # seconds between status checks (shorter — simple phantoms are faster)
 PB_MAX_POLL_TIME = 30 * 60    # 30 minutes
 
-# Prospeo
-PROSPEO_BASE = "https://api.prospeo.io"
-PROSPEO_DELAY = 0.5           # seconds between enrichment calls (limit is 30/sec, we use 2/sec)
+# Ark AI
+ARK_BASE = "https://api.ai-ark.com/api/developer-portal/v1"
+ARK_WEBHOOK_TIMEOUT = 15 * 60   # 15 minutes max wait for webhook
+ARK_POLL_INTERVAL = 30           # seconds between progress log checks
 
 # Instantly v2
 INSTANTLY_BASE = "https://api.instantly.ai/api/v2"
@@ -37,6 +38,13 @@ INSTANTLY_DELAY = 1           # seconds between calls
 
 # PhantomBuster scrape cap
 PB_MAX_PROFILES = 500
+
+# ---------------------------------------------------------------------------
+# Ark AI webhook bridge (shared between pipeline thread and Flask)
+# ---------------------------------------------------------------------------
+_ark_results = {}    # trackId -> webhook payload data
+_ark_events = {}     # trackId -> threading.Event
+_ark_lock = threading.Lock()
 
 
 def _log(msg: str):
@@ -217,62 +225,153 @@ def _phantombuster_parse_results(all_data: dict) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — Prospeo enrichment (LinkedIn URL first, name+company fallback)
+# Step 3 — Ark AI batch enrichment (LinkedIn URLs -> emails via webhook)
 # ---------------------------------------------------------------------------
 
-def _prospeo_enrich(linkedin_url: str) -> Optional[dict]:
+def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[dict]:
     """
-    Enrich a LinkedIn profile URL via Prospeo's v2 enrich-person API.
-    Returns a dict with first_name, last_name, email, company, title or None.
+    Send all LinkedIn URLs to Ark AI in one batch export request.
+    Blocks until the webhook delivers results (or timeout).
+    Returns list of dicts: {first_name, last_name, email, company, title, linkedin_url}
     """
-    api_key = os.environ["PROSPEO_API_KEY"]
-    headers = {"Content-Type": "application/json", "X-KEY": api_key}
+    api_key = os.environ["ARK_AI_API_KEY"]
+    headers = {"X-TOKEN": api_key, "Content-Type": "application/json"}
 
-    try:
-        resp = requests.post(
-            f"{PROSPEO_BASE}/enrich-person",
-            headers=headers,
-            json={
-                "only_verified_email": True,
-                "data": {"linkedin_url": linkedin_url},
-            },
-            timeout=30,
+    webhook_url = f"{webhook_base_url}/webhook/ark"
+    _log(f"Sending {len(linkedin_urls)} LinkedIn URLs to Ark AI for enrichment...")
+    _log(f"Webhook URL: {webhook_url}")
+
+    # Build the export request — filter by LinkedIn URLs
+    payload = {
+        "contact": {
+            "linkedin": {
+                "any": {
+                    "include": linkedin_urls,
+                }
+            }
+        },
+        "size": len(linkedin_urls),
+        "webhook": webhook_url,
+    }
+
+    resp = requests.post(
+        f"{ARK_BASE}/people/export",
+        headers=headers,
+        json=payload,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+
+    track_id = body.get("trackId")
+    if not track_id:
+        raise RuntimeError(f"Ark AI did not return a trackId. Response: {body}")
+
+    _log(f"Ark AI export started — trackId: {track_id}")
+    _log(f"Initial statistics: {body.get('statistics', {})}")
+
+    # Create an Event so the webhook handler can wake us up
+    event = threading.Event()
+    with _ark_lock:
+        _ark_events[track_id] = event
+        _ark_results[track_id] = None
+
+    # Wait for webhook, polling statistics for progress logs
+    elapsed = 0
+    while elapsed < ARK_WEBHOOK_TIMEOUT:
+        if event.wait(timeout=ARK_POLL_INTERVAL):
+            # Webhook arrived!
+            break
+        elapsed += ARK_POLL_INTERVAL
+
+        # Poll statistics endpoint for progress (non-blocking info only)
+        try:
+            stats_resp = requests.get(
+                f"{ARK_BASE}/people/statistics/{track_id}",
+                headers=headers,
+                timeout=15,
+            )
+            if stats_resp.ok:
+                stats = stats_resp.json()
+                s = stats.get("statistics", {})
+                state = stats.get("state", "UNKNOWN")
+                _log(
+                    f"Ark AI progress — state: {state}, "
+                    f"total: {s.get('total', '?')}, "
+                    f"found: {s.get('found', '?')}, "
+                    f"success: {s.get('success', '?')}, "
+                    f"failed: {s.get('failed', '?')} "
+                    f"(elapsed {elapsed}s)"
+                )
+        except Exception as exc:
+            _log(f"Statistics poll error (non-fatal): {exc}")
+
+    # Retrieve results
+    with _ark_lock:
+        webhook_data = _ark_results.pop(track_id, None)
+        _ark_events.pop(track_id, None)
+
+    if webhook_data is None:
+        raise TimeoutError(
+            f"Ark AI webhook not received within {ARK_WEBHOOK_TIMEOUT // 60} minutes "
+            f"for trackId {track_id}"
         )
-        if not resp.ok:
-            _log(f"Prospeo HTTP {resp.status_code} for {linkedin_url}")
-            return None
 
-        body = resp.json()
-        if body.get("error"):
-            return None
+    return _parse_ark_results(webhook_data)
 
-        person = body.get("person", {})
-        company_obj = body.get("company", {}) or {}
 
-        # Extract email
+def _parse_ark_results(webhook_data: dict) -> list[dict]:
+    """
+    Parse the Ark AI webhook payload into our standard lead format.
+    Only includes people with a verified email (found=True, status=VALID).
+    """
+    people = webhook_data.get("data", [])
+    stats = webhook_data.get("statistics", {})
+    _log(
+        f"Parsing Ark AI results — {len(people)} people, "
+        f"stats: total={stats.get('total', '?')}, found={stats.get('found', '?')}"
+    )
+
+    enriched = []
+    for person in people:
+        # Find a valid, verified email
         email_obj = person.get("email", {}) or {}
-        email_addr = email_obj.get("email", "") if isinstance(email_obj, dict) else ""
+        outputs = email_obj.get("output", []) or []
+
+        email_addr = ""
+        for entry in outputs:
+            if entry.get("found") and entry.get("status") == "VALID":
+                email_addr = entry.get("address", "")
+                break
 
         if not email_addr:
-            return None
+            continue
 
-        first = person.get("first_name", "")
-        last = person.get("last_name", "")
-        title = person.get("current_job_title", "")
-        company = company_obj.get("name", "")
+        # Extract person details
+        summary = person.get("summary", {}) or {}
+        company_obj = person.get("company", {}) or {}
+        company_summary = company_obj.get("summary", {}) or {}
+        link_obj = person.get("link", {}) or {}
 
-        return {
-            "first_name": first,
-            "last_name": last,
+        first_name = summary.get("first_name", "")
+        last_name = summary.get("last_name", "")
+        title = summary.get("title", "") or summary.get("headline", "")
+        company_name = company_summary.get("name", "")
+
+        # LinkedIn URL: prefer link.linkedin, fall back to identifier
+        linkedin_url = link_obj.get("linkedin", "") or person.get("identifier", "")
+
+        enriched.append({
+            "first_name": first_name,
+            "last_name": last_name,
             "email": email_addr,
-            "company": company,
+            "company": company_name,
             "title": title,
-        }
+            "linkedin_url": linkedin_url,
+        })
 
-    except requests.RequestException as exc:
-        _log(f"Prospeo error for {linkedin_url}: {exc}")
-
-    return None
+    _log(f"Ark AI enrichment: {len(enriched)} leads with verified emails out of {len(people)} people")
+    return enriched
 
 
 def _write_enrichment_log(rows: list[dict]):
@@ -376,53 +475,43 @@ def run_pipeline(post_url: str):
         _send_error("PHANTOMBUSTER PARSE", "No profiles found in output", post_url)
         return
 
-    # ---- Step 3: Prospeo enrichment ----
-    enriched_leads = []
-    skipped_no_email = 0
-    log_rows = []
+    # ---- Step 3: Ark AI batch enrichment ----
+    webhook_base_url = os.environ.get("BASE_URL", "https://web-production-e430.up.railway.app")
+    try:
+        enriched_leads = _ark_enrich_batch(profile_urls, webhook_base_url)
+    except Exception as exc:
+        _send_error("ARK AI ENRICHMENT", str(exc), post_url)
+        return
 
-    for i, url in enumerate(profile_urls):
-        _log(f"Enriching {i+1}/{total_scraped}: {url}")
-        try:
-            result = _prospeo_enrich(url)
-            if result:
-                result["linkedin_url"] = url
-                enriched_leads.append(result)
-                log_rows.append({
-                    "linkedin_url": url,
-                    "first_name": result["first_name"],
-                    "last_name": result["last_name"],
-                    "email": result["email"],
-                    "company": result["company"],
-                    "status": "enriched",
-                })
-            else:
-                skipped_no_email += 1
-                log_rows.append({
-                    "linkedin_url": url,
-                    "first_name": "", "last_name": "", "email": "", "company": "",
-                    "status": "no_verified_email",
-                })
-        except Exception as exc:
-            _log(f"Prospeo exception for {url}: {exc}")
-            skipped_no_email += 1
+    total_enriched = len(enriched_leads)
+    skipped_no_email = total_scraped - total_enriched
+    _log(f"Enriched {total_enriched} leads, skipped {skipped_no_email}")
+
+    # Build enrichment log from batch results
+    log_rows = []
+    enriched_urls = {lead["linkedin_url"] for lead in enriched_leads}
+    for lead in enriched_leads:
+        log_rows.append({
+            "linkedin_url": lead["linkedin_url"],
+            "first_name": lead["first_name"],
+            "last_name": lead["last_name"],
+            "email": lead["email"],
+            "company": lead["company"],
+            "status": "enriched",
+        })
+    for url in profile_urls:
+        if url not in enriched_urls:
             log_rows.append({
                 "linkedin_url": url,
                 "first_name": "", "last_name": "", "email": "", "company": "",
-                "status": f"error: {exc}",
+                "status": "no_verified_email",
             })
-
-        if i < total_scraped - 1:
-            time.sleep(PROSPEO_DELAY)
 
     # Write enrichment log
     try:
         _write_enrichment_log(log_rows)
     except Exception as exc:
         _log(f"Failed to write enrichment log: {exc}")
-
-    total_enriched = len(enriched_leads)
-    _log(f"Enriched {total_enriched} leads, skipped {skipped_no_email}")
 
     # ---- Step 4: Title filter ----
     try:
@@ -464,7 +553,7 @@ def run_pipeline(post_url: str):
     summary = (
         f"\u2705 Pipeline complete for:\n{post_url}\n\n"
         f"\U0001f465 Engagers scraped: {total_scraped}\n"
-        f"\U0001f4e7 Emails enriched by Prospeo: {total_enriched} ({enriched_pct}%)\n"
+        f"\U0001f4e7 Emails enriched by Ark AI: {total_enriched} ({enriched_pct}%)\n"
         f"\U0001f3af Passed title filter: {len(kept_leads)}\n"
         f"\U0001f6ab Filtered out by title: {dropped_count}\n"
         f"\u23ed\ufe0f Skipped (no email found): {skipped_no_email}\n"

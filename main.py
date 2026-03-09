@@ -13,7 +13,7 @@ import time
 from flask import Flask, jsonify, request
 from dotenv import load_dotenv
 
-from pipeline import run_pipeline
+from pipeline import run_pipeline, _ark_results, _ark_events, _ark_lock
 
 load_dotenv()
 
@@ -88,6 +88,36 @@ def slack_events():
         # Run pipeline in background thread so we respond to Slack within 3 seconds
         thread = threading.Thread(target=run_pipeline, args=(post_url,), daemon=True)
         thread.start()
+
+    return jsonify({"ok": True}), 200
+
+
+@app.route("/webhook/ark", methods=["POST"])
+def ark_webhook():
+    """Receive enrichment results from Ark AI webhook callback."""
+    data = request.json or {}
+
+    track_id = data.get("trackId", "")
+    people = data.get("data", [])
+    state = data.get("state", "UNKNOWN")
+    stats = data.get("statistics", {})
+
+    print(
+        f"[ARK WEBHOOK] Received — trackId: {track_id}, state: {state}, "
+        f"people: {len(people)}, stats: {stats}",
+        flush=True,
+    )
+    # Debug: log top-level keys for first test (helps if field names differ)
+    print(f"[ARK WEBHOOK] Payload keys: {list(data.keys())}", flush=True)
+
+    if track_id:
+        with _ark_lock:
+            if track_id in _ark_events:
+                _ark_results[track_id] = data
+                _ark_events[track_id].set()
+                print(f"[ARK WEBHOOK] Signaled pipeline for trackId: {track_id}", flush=True)
+            else:
+                print(f"[ARK WEBHOOK] No waiting pipeline for trackId: {track_id}", flush=True)
 
     return jsonify({"ok": True}), 200
 

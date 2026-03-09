@@ -29,7 +29,7 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 
 1. **Scrapes engagers** — Uses PhantomBuster (two phantoms: likers + commenters) to grab everyone who liked/commented on that LinkedIn post.
 
-2. **Finds their emails** — Uses Prospeo to look up verified email addresses for each person. Only returns emails Prospeo can verify as real (`only_verified_email: true`). This gives a 30-50% hit rate, which is intentionally conservative to protect sender reputation.
+2. **Finds their emails** — Uses Ark AI to look up verified email addresses for all scraped profiles in one batch. Ark AI has 400M+ people records and verifies emails in real-time via BounceBan. Only returns emails verified as `VALID`. This is an async/webhook-based flow: we send all URLs at once, Ark AI processes them, then delivers results to our `/webhook/ark` endpoint.
 
 3. **Filters by job title** — Only keeps decision-makers (founders, CEOs, VPs, directors). Drops students, interns, freelancers.
 
@@ -45,8 +45,8 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 |---|---|---|
 | PhantomBuster approach | TWO separate phantoms (likers + commenters), launched in parallel, results merged & deduped | The combined phantom got corrupted after heavy testing. Separate phantoms are simpler and more robust. |
 | PhantomBuster API version | v2 (`/api/v2/agents/launch` with `argument` passed directly, `/api/v2/agents/fetch-output` for polling) | Pass the post URL directly in the launch call. Results come as CSV on S3, extracted via regex from the console output. |
-| Prospeo enrichment | v2 `/enrich-person` endpoint with `only_verified_email: true` | Only returns verified emails to protect sender reputation. 30-50% enrichment rate is expected and intentional. |
-| Prospeo rate limiting | 0.5 seconds between calls (2/sec) | Shubh's plan allows 30/sec. We use 2/sec for safety margin. |
+| Ark AI enrichment | `/people/export` endpoint — async batch with webhook callback | Sends all LinkedIn URLs in one request. Results arrive via webhook to `/webhook/ark`. Only keeps emails with `found=True` and `status=VALID`. |
+| Ark AI architecture | `threading.Event` bridges async webhook to synchronous pipeline | Pipeline thread waits on Event; Flask webhook handler signals it when results arrive. Shared state protected by `threading.Lock`. |
 | Instantly API version | v2 (`/api/v2/leads` with Bearer auth). **IMPORTANT: use `campaign` field, NOT `campaign_id`** | `campaign_id` is silently ignored. Must use `campaign`. |
 | Slack integration | Events API with URL verification | Standard for production, works with Railway |
 | Deployment | Railway, auto-deploys from GitHub | Simple, reliable |
@@ -58,8 +58,8 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 
 | File | What it does |
 |---|---|
-| `main.py` | The front door. Listens for Slack messages, verifies they're real, spots LinkedIn URLs, and kicks off the pipeline in a background thread. |
-| `pipeline.py` | The brain. Launches both PhantomBuster phantoms, polls for results, enriches via Prospeo, filters by title, pushes to Instantly, sends Slack summary. |
+| `main.py` | The front door. Listens for Slack messages, verifies they're real, spots LinkedIn URLs, kicks off the pipeline in a background thread, and receives Ark AI webhook callbacks at `/webhook/ark`. |
+| `pipeline.py` | The brain. Launches both PhantomBuster phantoms, polls for results, enriches via Ark AI (batch + webhook), filters by title, pushes to Instantly, sends Slack summary. |
 | `title_filter.py` | The bouncer. Checks job titles and only lets decision-makers through. |
 | `.env` | API keys (filled in and working — all 5 keys verified). |
 | `.env.example` | Template showing which API keys are needed. |
@@ -81,8 +81,10 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 - **Slack channel**: `#linkedin-scraper`
 - **PhantomBuster poll interval**: 30 seconds
 - **PhantomBuster max wait**: 30 minutes
-- **Prospeo delay between calls**: 0.5 seconds
+- **Ark AI webhook timeout**: 15 minutes
+- **Ark AI statistics poll interval**: 30 seconds
 - **Instantly delay between calls**: 1 second
+- **Ark AI base URL**: `https://api.ai-ark.com/api/developer-portal/v1`
 
 ---
 
@@ -91,10 +93,11 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 | Variable | What it is | Where Shubh gets it |
 |---|---|---|
 | `PHANTOMBUSTER_API_KEY` | Authenticates with PhantomBuster | PhantomBuster dashboard → profile icon → API Keys |
-| `PROSPEO_API_KEY` | Authenticates with Prospeo | Prospeo dashboard → API in sidebar |
+| `ARK_AI_API_KEY` | Authenticates with Ark AI for email enrichment | Ark AI dashboard → API settings |
 | `INSTANTLY_API_KEY` | Authenticates with Instantly | Instantly → Settings → API → generate key |
 | `SLACK_BOT_TOKEN` | Lets the bot read/send Slack messages | Slack app → OAuth & Permissions → Bot Token (starts with `xoxb-`) |
 | `SLACK_SIGNING_SECRET` | Verifies incoming requests are from Slack | Slack app → Basic Information → Signing Secret |
+| `BASE_URL` | The public URL of the Railway deployment (for Ark AI webhook) | Set to `https://web-production-e430.up.railway.app` |
 
 ---
 
@@ -105,6 +108,7 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 - **Railway public URL**: `https://web-production-e430.up.railway.app`
 - **Health check**: `/health` returns `{"status":"ok"}`
 - **Slack Events URL**: `https://web-production-e430.up.railway.app/slack/events`
+- **Ark AI Webhook URL**: `https://web-production-e430.up.railway.app/webhook/ark`
 - **Auto-deploy**: Railway auto-deploys when code is pushed to `main` branch on GitHub
 
 ---
@@ -131,6 +135,11 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 13. **Prospeo enrichment too slow** — Was waiting 7 seconds between calls (2s delay + 5s profile delay). Shubh's plan allows 30 requests/sec. **Fixed by reducing to 0.5s between calls** — 14x speedup.
 14. **Railway not auto-deploying** — After pushing the Prospeo speedup commit, Railway kept redeploying the old commit. Fixed by pushing a new commit to force Railway to pick it up.
 
+### Session 4 (2026-03-09) — Replace Prospeo with Ark AI:
+15. **Prospeo enrichment rates too low** — 30-50% hit rate was not good enough. **Replaced Prospeo with Ark AI** which has 400M+ records and real-time email verification via BounceBan.
+16. **Architectural change: sync to async** — Prospeo was synchronous (one URL at a time). Ark AI is asynchronous (batch export + webhook). Implemented `threading.Event` bridge so the pipeline thread waits for Ark AI's webhook delivery instead of polling one-by-one.
+17. **New webhook endpoint** — Added `/webhook/ark` POST route to `main.py` that receives Ark AI results, stores them in shared dict, and signals the waiting pipeline thread.
+
 ---
 
 ## Troubleshooting guide (if something breaks)
@@ -139,7 +148,9 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 |---|---|---|
 | Bot doesn't respond in Slack at all | Railway app is down | Check Railway dashboard — restart if needed |
 | Bot says "Got it!" but then reports 0 profiles | LinkedIn session cookie expired | Go to PhantomBuster dashboard → reconnect LinkedIn on BOTH the likers and commenters phantoms |
-| Prospeo returns 0 emails | Prospeo credits exhausted | Check Prospeo dashboard for credit balance |
+| Ark AI returns 0 emails | Ark AI credits exhausted or API key invalid | Check Ark AI dashboard for credit balance and API key |
+| Pipeline fails at ARK AI ENRICHMENT with timeout | Webhook not received within 15 minutes | Check Railway logs for `[ARK WEBHOOK]` entries. If none, verify `BASE_URL` env var is correct and Railway is publicly accessible |
+| Ark AI webhook arrives but pipeline doesn't continue | `trackId` mismatch between request and webhook | Check Railway logs — the webhook log should show the trackId. Compare with the export request log |
 | Instantly shows errors | API key rotated or campaign deleted | Check Instantly settings for valid API key; verify campaign still exists |
 | Pipeline works but leads aren't in the campaign | Using `campaign_id` instead of `campaign` | Verify pipeline.py uses `"campaign"` field (not `"campaign_id"`) |
 
@@ -164,9 +175,10 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 ## Error handling notes
 
 - Every step in the pipeline is wrapped in try/except — if one step fails, it sends an error to Slack and stops gracefully
-- If Prospeo can't find an email for someone, that person is silently skipped (not an error)
+- If Ark AI can't find a verified email for someone, that person is silently skipped (not an error)
 - If Instantly says a lead already exists, it's counted as a duplicate and skipped
 - All errors print to console with timestamps (visible in Railway logs)
+- Ark AI webhook timeout (15 min) sends error to Slack if webhook never arrives
 
 ---
 
