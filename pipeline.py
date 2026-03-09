@@ -230,97 +230,119 @@ def _phantombuster_parse_results(all_data: dict) -> list[str]:
 
 def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[dict]:
     """
-    Send all LinkedIn URLs to Ark AI in one batch export request.
-    Blocks until the webhook delivers results (or timeout).
+    Send LinkedIn URLs to Ark AI in batches of 300 (API limit).
+    Blocks until all webhook results arrive (or timeout).
     Returns list of dicts: {first_name, last_name, email, company, title, linkedin_url}
     """
     api_key = os.environ["ARK_AI_API_KEY"]
     headers = {"X-TOKEN": api_key, "Content-Type": "application/json"}
-
     webhook_url = f"{webhook_base_url}/webhook/ark"
-    _log(f"Sending {len(linkedin_urls)} LinkedIn URLs to Ark AI for enrichment...")
+
+    # Split into batches of 300 (Ark AI limit per request)
+    batch_size = 300
+    batches = [linkedin_urls[i:i + batch_size] for i in range(0, len(linkedin_urls), batch_size)]
+    _log(f"Sending {len(linkedin_urls)} LinkedIn URLs to Ark AI in {len(batches)} batch(es) of up to {batch_size}...")
     _log(f"Webhook URL: {webhook_url}")
 
-    # Build the export request — filter by LinkedIn URLs
-    payload = {
-        "contact": {
-            "linkedin": {
-                "any": {
-                    "include": linkedin_urls,
+    # Launch all batches and collect their trackIds + events
+    track_ids = []
+    events = []
+    for batch_num, batch_urls in enumerate(batches, 1):
+        _log(f"Launching batch {batch_num}/{len(batches)} ({len(batch_urls)} URLs)...")
+
+        payload = {
+            "contact": {
+                "linkedin": {
+                    "any": {
+                        "include": batch_urls,
+                    }
                 }
-            }
-        },
-        "page": 0,
-        "size": len(linkedin_urls),
-        "webhook": webhook_url,
-    }
+            },
+            "page": 0,
+            "size": len(batch_urls),
+            "webhook": webhook_url,
+        }
 
-    resp = requests.post(
-        f"{ARK_BASE}/people/export",
-        headers=headers,
-        json=payload,
-        timeout=60,
-    )
-    if not resp.ok:
-        _log(f"Ark AI export error — HTTP {resp.status_code}: {resp.text}")
-    resp.raise_for_status()
-    body = resp.json()
-
-    track_id = body.get("trackId")
-    if not track_id:
-        raise RuntimeError(f"Ark AI did not return a trackId. Response: {body}")
-
-    _log(f"Ark AI export started — trackId: {track_id}")
-    _log(f"Initial statistics: {body.get('statistics', {})}")
-
-    # Create an Event so the webhook handler can wake us up
-    event = threading.Event()
-    with _ark_lock:
-        _ark_events[track_id] = event
-        _ark_results[track_id] = None
-
-    # Wait for webhook, polling statistics for progress logs
-    elapsed = 0
-    while elapsed < ARK_WEBHOOK_TIMEOUT:
-        if event.wait(timeout=ARK_POLL_INTERVAL):
-            # Webhook arrived!
-            break
-        elapsed += ARK_POLL_INTERVAL
-
-        # Poll statistics endpoint for progress (non-blocking info only)
-        try:
-            stats_resp = requests.get(
-                f"{ARK_BASE}/people/statistics/{track_id}",
-                headers=headers,
-                timeout=15,
-            )
-            if stats_resp.ok:
-                stats = stats_resp.json()
-                s = stats.get("statistics", {})
-                state = stats.get("state", "UNKNOWN")
-                _log(
-                    f"Ark AI progress — state: {state}, "
-                    f"total: {s.get('total', '?')}, "
-                    f"found: {s.get('found', '?')}, "
-                    f"success: {s.get('success', '?')}, "
-                    f"failed: {s.get('failed', '?')} "
-                    f"(elapsed {elapsed}s)"
-                )
-        except Exception as exc:
-            _log(f"Statistics poll error (non-fatal): {exc}")
-
-    # Retrieve results
-    with _ark_lock:
-        webhook_data = _ark_results.pop(track_id, None)
-        _ark_events.pop(track_id, None)
-
-    if webhook_data is None:
-        raise TimeoutError(
-            f"Ark AI webhook not received within {ARK_WEBHOOK_TIMEOUT // 60} minutes "
-            f"for trackId {track_id}"
+        resp = requests.post(
+            f"{ARK_BASE}/people/export",
+            headers=headers,
+            json=payload,
+            timeout=60,
         )
+        if not resp.ok:
+            _log(f"Ark AI export error — HTTP {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+        body = resp.json()
 
-    return _parse_ark_results(webhook_data)
+        track_id = body.get("trackId")
+        if not track_id:
+            raise RuntimeError(f"Ark AI did not return a trackId for batch {batch_num}. Response: {body}")
+
+        _log(f"Batch {batch_num} started — trackId: {track_id}, stats: {body.get('statistics', {})}")
+
+        # Create an Event so the webhook handler can wake us up
+        event = threading.Event()
+        with _ark_lock:
+            _ark_events[track_id] = event
+            _ark_results[track_id] = None
+
+        track_ids.append(track_id)
+        events.append(event)
+
+        # Small delay between batch requests to be polite to the API
+        if batch_num < len(batches):
+            time.sleep(1)
+
+    # Wait for ALL webhooks to arrive
+    all_enriched = []
+    for batch_num, (track_id, event) in enumerate(zip(track_ids, events), 1):
+        _log(f"Waiting for batch {batch_num}/{len(batches)} (trackId: {track_id})...")
+
+        elapsed = 0
+        while elapsed < ARK_WEBHOOK_TIMEOUT:
+            if event.wait(timeout=ARK_POLL_INTERVAL):
+                break
+            elapsed += ARK_POLL_INTERVAL
+
+            # Poll statistics endpoint for progress
+            try:
+                stats_resp = requests.get(
+                    f"{ARK_BASE}/people/statistics/{track_id}",
+                    headers=headers,
+                    timeout=15,
+                )
+                if stats_resp.ok:
+                    stats = stats_resp.json()
+                    s = stats.get("statistics", {})
+                    state = stats.get("state", "UNKNOWN")
+                    _log(
+                        f"Batch {batch_num} progress — state: {state}, "
+                        f"total: {s.get('total', '?')}, "
+                        f"found: {s.get('found', '?')}, "
+                        f"success: {s.get('success', '?')}, "
+                        f"failed: {s.get('failed', '?')} "
+                        f"(elapsed {elapsed}s)"
+                    )
+            except Exception as exc:
+                _log(f"Statistics poll error (non-fatal): {exc}")
+
+        # Retrieve results for this batch
+        with _ark_lock:
+            webhook_data = _ark_results.pop(track_id, None)
+            _ark_events.pop(track_id, None)
+
+        if webhook_data is None:
+            raise TimeoutError(
+                f"Ark AI webhook not received within {ARK_WEBHOOK_TIMEOUT // 60} minutes "
+                f"for batch {batch_num} (trackId {track_id})"
+            )
+
+        batch_leads = _parse_ark_results(webhook_data)
+        _log(f"Batch {batch_num} returned {len(batch_leads)} enriched leads")
+        all_enriched.extend(batch_leads)
+
+    _log(f"All {len(batches)} batch(es) complete — {len(all_enriched)} total enriched leads")
+    return all_enriched
 
 
 def _parse_ark_results(webhook_data: dict) -> list[dict]:
