@@ -1,8 +1,8 @@
 # CLAUDE.md — Project Context & Instructions
 
-## Project Status: COMPLETE AND RUNNING
+## Project Status: ARK AI MIGRATION IN PROGRESS — NOT YET WORKING
 
-The pipeline is fully built, deployed, and tested. It works end-to-end from Slack.
+Replaced Prospeo with Ark AI for email enrichment. Code is written and deployed but **not yet tested successfully end-to-end**. The Ark AI enrichment step has had 3 bugs so far (all fixed in code, deployed to Railway). The latest fix (webhook resend fallback) has NOT been tested yet. See STATUS.md for full details.
 
 ---
 
@@ -135,10 +135,13 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 13. **Prospeo enrichment too slow** — Was waiting 7 seconds between calls (2s delay + 5s profile delay). Shubh's plan allows 30 requests/sec. **Fixed by reducing to 0.5s between calls** — 14x speedup.
 14. **Railway not auto-deploying** — After pushing the Prospeo speedup commit, Railway kept redeploying the old commit. Fixed by pushing a new commit to force Railway to pick it up.
 
-### Session 4 (2026-03-09) — Replace Prospeo with Ark AI:
+### Session 4 (2026-03-09/10) — Replace Prospeo with Ark AI (IN PROGRESS):
 15. **Prospeo enrichment rates too low** — 30-50% hit rate was not good enough. **Replaced Prospeo with Ark AI** which has 400M+ records and real-time email verification via BounceBan.
 16. **Architectural change: sync to async** — Prospeo was synchronous (one URL at a time). Ark AI is asynchronous (batch export + webhook). Implemented `threading.Event` bridge so the pipeline thread waits for Ark AI's webhook delivery instead of polling one-by-one.
 17. **New webhook endpoint** — Added `/webhook/ark` POST route to `main.py` that receives Ark AI results, stores them in shared dict, and signals the waiting pipeline thread.
+18. **Ark AI 400: missing `page` field** — First test returned `400 Bad Request`. Ark AI requires `"page": 0` in the export request body. **Fixed.**
+19. **Ark AI 400: batch size limit of 300** — Second test returned `400: contact.linkedin.any.include size must be less or equal than 300`. A viral post had 1,878 engagers. **Fixed by splitting URLs into batches of 300** — sends multiple export requests and waits for each webhook.
+20. **Ark AI webhook not received for batch 1** — Third test: 7 batches launched, one webhook arrived (for a later batch, trackId `ccfe7b5e-...`) but batch 1's webhook (trackId `5be63303-...`) never arrived within 15 minutes. **Fixed by adding webhook resend fallback** — if webhook times out, pipeline calls `PATCH /people/notify` to request Ark AI resend it, then waits 3 more minutes. **THIS FIX HAS NOT BEEN TESTED YET.**
 
 ---
 
@@ -220,3 +223,63 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 - `fileMgmt: "delete"` clears old CSV data but doesn't fix corrupted internal state
 - There is NO API to clear a phantom's internal leads database
 - Session cookies can expire — reconnect LinkedIn in the dashboard if scraping returns 0
+
+---
+
+## Ark AI API reference (for future debugging)
+
+### Endpoints used:
+| Endpoint | Method | What it does |
+|---|---|---|
+| `/people/export` | POST | Sends a batch of LinkedIn URLs, returns a `trackId`. Results delivered via webhook. |
+| `/people/statistics/{trackId}` | GET | Polls processing progress (state, total, found, success, failed). |
+| `/people/notify` | PATCH | Resends the webhook for a completed export. Takes `trackId` and `webhook` URL. |
+
+### Authentication:
+- Header: `X-TOKEN: <api_key>`
+- Content-Type: `application/json`
+
+### Key API constraints:
+- **Max 300 LinkedIn URLs per export request** (`contact.linkedin.any.include` limit)
+- **`page: 0` is required** in every export request body
+- Rate limits: 5 req/sec, 300/min, 18,000/hour (not a concern — we make ~7 requests per pipeline run)
+- Webhook retries up to 30 times automatically
+- Max 10,000 results per export
+
+### Webhook payload structure:
+```
+{
+  "trackId": "uuid",
+  "state": "DONE",
+  "statistics": {"total": N, "found": N},
+  "data": [
+    {
+      "identifier": "linkedin-id",
+      "summary": {"first_name": "", "last_name": "", "title": "", "headline": ""},
+      "company": {"summary": {"name": ""}},
+      "link": {"linkedin": "https://linkedin.com/in/..."},
+      "email": {
+        "state": "DONE",
+        "output": [{"address": "email@example.com", "found": true, "status": "VALID"}]
+      }
+    }
+  ]
+}
+```
+
+### How the pipeline uses Ark AI:
+1. Splits LinkedIn URLs into batches of 300
+2. POSTs each batch to `/people/export` with `contact.linkedin.any.include` filter
+3. Each request returns a `trackId`; pipeline creates a `threading.Event` per trackId
+4. Pipeline thread waits on each Event (polls `/people/statistics/{trackId}` for progress logs)
+5. Flask webhook handler at `/webhook/ark` receives results, stores in shared dict, signals Event
+6. If webhook doesn't arrive in 15 min, calls `PATCH /people/notify` to resend, waits 3 more min
+7. Parses webhook payload: only keeps people with `email.output[].found=True` and `status="VALID"`
+8. Returns same dict format as old Prospeo code: `{first_name, last_name, email, company, title, linkedin_url}`
+
+### Ark AI docs:
+- Main docs: https://docs.ai-ark.com/
+- Export endpoint: https://docs.ai-ark.com/reference/people-export-with-email
+- Webhook payload: https://docs.ai-ark.com/reference/export-people-webhook
+- Statistics: https://docs.ai-ark.com/reference/get-email-statistics-by-track-id-1
+- Resend webhook: https://docs.ai-ark.com/reference/resend-webhook-notification-1
