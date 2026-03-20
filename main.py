@@ -112,14 +112,51 @@ def ark_webhook():
 
     if track_id:
         with _ark_lock:
+            _ark_results[track_id] = data
             if track_id in _ark_events:
-                _ark_results[track_id] = data
                 _ark_events[track_id].set()
                 print(f"[ARK WEBHOOK] Signaled pipeline for trackId: {track_id}", flush=True)
             else:
-                print(f"[ARK WEBHOOK] No waiting pipeline for trackId: {track_id}", flush=True)
+                # Buffer result — pipeline may not have registered the event yet
+                print(f"[ARK WEBHOOK] Buffered result for trackId: {track_id} (pipeline not waiting yet)", flush=True)
 
     return jsonify({"ok": True}), 200
+
+
+@app.route("/test/enrich", methods=["POST"])
+def test_enrich():
+    """
+    Test endpoint: send LinkedIn URLs for Ark AI enrichment + Bouncify validation.
+    Expects JSON body: {"urls": ["https://linkedin.com/in/someone", ...]}
+    Returns enrichment + validation results without touching Slack/PhantomBuster/Instantly.
+    """
+    from pipeline import _ark_enrich_batch, _bouncify_verify_batch
+
+    data = request.json or {}
+    urls = data.get("urls", [])
+
+    if not urls:
+        return jsonify({"error": "No URLs provided. Send JSON: {\"urls\": [\"...\", ...]}"}), 400
+
+    webhook_base_url = os.environ.get("BASE_URL", "https://web-production-e430.up.railway.app")
+
+    try:
+        enriched = _ark_enrich_batch(urls, webhook_base_url)
+    except Exception as exc:
+        return jsonify({"error": f"Ark AI enrichment failed: {exc}"}), 500
+
+    try:
+        verified, bouncify_rejected = _bouncify_verify_batch(enriched)
+    except Exception as exc:
+        return jsonify({"error": f"Bouncify validation failed: {exc}"}), 500
+
+    return jsonify({
+        "total_urls": len(urls),
+        "enriched": len(enriched),
+        "bouncify_passed": len(verified),
+        "bouncify_rejected": bouncify_rejected,
+        "leads": verified,
+    }), 200
 
 
 @app.route("/health", methods=["GET"])

@@ -284,7 +284,12 @@ def _ark_enrich_batch(linkedin_urls: list[str], webhook_base_url: str) -> list[d
         event = threading.Event()
         with _ark_lock:
             _ark_events[track_id] = event
-            _ark_results[track_id] = None
+            # Check if webhook already arrived before we registered (race condition fix)
+            if _ark_results.get(track_id) is not None:
+                event.set()  # Webhook beat us — data already buffered
+                _log(f"Batch {batch_num} webhook already arrived before registration!")
+            else:
+                _ark_results[track_id] = None
 
         track_ids.append(track_id)
         events.append(event)
@@ -438,6 +443,70 @@ def _write_enrichment_log(rows: list[dict]):
 
 
 # ---------------------------------------------------------------------------
+# Step 4B — Bouncify email validation (optional)
+# ---------------------------------------------------------------------------
+
+BOUNCIFY_DELAY = 0.5  # seconds between calls (120 req/min limit)
+
+
+def _bouncify_verify_email(email: str) -> bool:
+    """Verify a single email via Bouncify. Returns True if deliverable."""
+    api_key = os.environ.get("BOUNCIFY_API_KEY", "")
+    if not api_key:
+        return True  # No key configured — skip validation
+
+    try:
+        resp = requests.get(
+            "https://api.bouncify.io/v1/verify",
+            params={"apikey": api_key, "email": email},
+            timeout=30,
+        )
+        if not resp.ok:
+            _log(f"Bouncify error for {email}: HTTP {resp.status_code} — keeping lead")
+            return True  # On error, keep the lead
+
+        result = resp.json().get("result", "")
+        # Accept "deliverable" emails; reject "undeliverable" and "risky"
+        return result == "deliverable"
+
+    except Exception as exc:
+        _log(f"Bouncify exception for {email}: {exc} — keeping lead")
+        return True  # On error, keep the lead
+
+
+def _bouncify_verify_batch(leads: list[dict]) -> tuple[list[dict], int]:
+    """
+    Validate all leads through Bouncify.
+    Returns (valid_leads, rejected_count).
+    If BOUNCIFY_API_KEY is not set, passes all leads through.
+    """
+    api_key = os.environ.get("BOUNCIFY_API_KEY", "")
+    if not api_key:
+        _log("BOUNCIFY_API_KEY not set — skipping email validation")
+        return leads, 0
+
+    _log(f"Validating {len(leads)} emails through Bouncify...")
+    valid = []
+    rejected = 0
+
+    for i, lead in enumerate(leads):
+        email = lead["email"]
+        _log(f"Bouncify {i+1}/{len(leads)}: {email}")
+
+        if _bouncify_verify_email(email):
+            valid.append(lead)
+        else:
+            _log(f"Bouncify rejected: {email}")
+            rejected += 1
+
+        if i < len(leads) - 1:
+            time.sleep(BOUNCIFY_DELAY)
+
+    _log(f"Bouncify validation: {len(valid)} passed, {rejected} rejected")
+    return valid, rejected
+
+
+# ---------------------------------------------------------------------------
 # Step 5 — Instantly v2 push
 # ---------------------------------------------------------------------------
 
@@ -573,13 +642,22 @@ def run_pipeline(post_url: str):
 
     _log(f"Title filter: {len(kept_leads)} kept, {dropped_count} dropped")
 
+    # ---- Step 4B: Bouncify email validation ----
+    try:
+        verified_leads, bouncify_rejected = _bouncify_verify_batch(kept_leads)
+    except Exception as exc:
+        _send_error("BOUNCIFY VALIDATION", str(exc), post_url)
+        return
+
+    _log(f"Bouncify: {len(verified_leads)} verified, {bouncify_rejected} rejected")
+
     # ---- Step 5: Instantly push ----
     added_count = 0
     duplicates_skipped = 0
     errors_count = 0
 
-    for i, lead in enumerate(kept_leads):
-        _log(f"Pushing to Instantly {i+1}/{len(kept_leads)}: {lead['email']}")
+    for i, lead in enumerate(verified_leads):
+        _log(f"Pushing to Instantly {i+1}/{len(verified_leads)}: {lead['email']}")
         try:
             result = _instantly_add_lead(lead, post_url)
             if result == "added":
@@ -592,7 +670,7 @@ def run_pipeline(post_url: str):
             _log(f"Instantly exception for {lead['email']}: {exc}")
             errors_count += 1
 
-        if i < len(kept_leads) - 1:
+        if i < len(verified_leads) - 1:
             time.sleep(INSTANTLY_DELAY)
 
     # ---- Step 6: Slack summary ----
@@ -601,12 +679,17 @@ def run_pipeline(post_url: str):
     secs = int(elapsed % 60)
     enriched_pct = round((total_enriched / total_scraped) * 100) if total_scraped else 0
 
+    bouncify_line = ""
+    if os.environ.get("BOUNCIFY_API_KEY"):
+        bouncify_line = f"\U0001f50d Bouncify rejected: {bouncify_rejected}\n"
+
     summary = (
         f"\u2705 Pipeline complete for:\n{post_url}\n\n"
         f"\U0001f465 Engagers scraped: {total_scraped}\n"
         f"\U0001f4e7 Emails enriched by Ark AI: {total_enriched} ({enriched_pct}%)\n"
         f"\U0001f3af Passed title filter: {len(kept_leads)}\n"
         f"\U0001f6ab Filtered out by title: {dropped_count}\n"
+        f"{bouncify_line}"
         f"\u23ed\ufe0f Skipped (no email found): {skipped_no_email}\n"
         f"\u2795 Added to Instantly campaign: {added_count}\n"
         f"\U0001f501 Duplicates skipped: {duplicates_skipped}\n"

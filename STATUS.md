@@ -1,71 +1,68 @@
 # STATUS.md — Current Project State
 
-**Last updated:** 2026-03-10 (end of session 5)
+**Last updated:** 2026-03-20 (session 6)
 
 ---
 
-## Current state: TWO PARALLEL TRACKS
-
-### Track 1: Prospeo — emailed their team about bad enrichment
-### Track 2: Ark AI migration — deployed, not yet tested end-to-end
+## Current state: ARK AI FIXES DEPLOYED + BOUNCIFY ADDED — NEEDS TESTING
 
 ---
 
-## Session 5 summary (2026-03-10)
+## Session 6 summary (2026-03-20)
 
 ### What we did:
-Ran a Prospeo enrichment test to diagnose why enrichment rates were so bad.
+Three major changes to fix Ark AI reliability, add email validation, and clean up Prospeo:
 
-### What we found:
-- Tested against a LinkedIn post with **1,880 engagers**
-- **419 emails found** (22.3% enrichment rate)
-- **1,461 returned HTTP 400 errors** (not "no email found" — actual errors)
-- **Root cause:** PhantomBuster returns two types of LinkedIn URLs:
-  - Normal slugs like `linkedin.com/in/john-doe` — Prospeo handles these fine
-  - Encoded IDs like `linkedin.com/in/ACoAABQuLHEB...` — Prospeo rejects ALL of these with HTTP 400
-- **78% of scraped profiles** come as encoded IDs, which Prospeo can't handle
-- So the real enrichment rate for URLs Prospeo accepts is much higher — it's just rejecting most of the input
+### Phase 1: Fix Ark AI webhook reliability
+1. **Switched from Flask dev server to gunicorn** — Flask's built-in server drops requests under concurrent load. Now using gunicorn with 1 worker + 4 threads (1 worker keeps shared memory working; 4 threads handle concurrent webhooks).
+2. **Fixed race condition** — If Ark AI sent the webhook before the pipeline registered its `threading.Event`, the data was silently dropped. Now: webhook handler buffers results even if pipeline hasn't registered yet, and pipeline checks for pre-arrived data after registering.
+3. **These two fixes together should resolve the "webhook not received" issue** that blocked all previous Ark AI tests.
 
-### What Shubh did:
-- Emailed the Prospeo team with these findings and the raw CSV file
-- Waiting to hear back from them
+### Phase 2: Added Bouncify email validation
+- New step between title filter and Instantly push
+- Uses `GET https://api.bouncify.io/v1/verify` — single email verification
+- 0.5s delay between calls (120 req/min limit)
+- **Graceful degradation**: if `BOUNCIFY_API_KEY` is not set, validation is skipped entirely
+- **Error-safe**: if Bouncify API errors, the lead is kept (don't lose data)
+- Slack summary now shows Bouncify rejection count
 
-### Files created this session:
-- `prospeo_test.py` — standalone script that scrapes a LinkedIn post and enriches via Prospeo, outputs a CSV with results and enrichment rate
-- `prospeo_test_20260310_122124.csv` — the actual test results (1,880 rows) shared with Prospeo team
+### Phase 3: Removed Prospeo
+- Deleted `prospeo_test.py` and `prospeo_test_20260310_122124.csv`
+- Updated README.md to reference Ark AI + Bouncify instead of Prospeo
+- Updated .env.example with `BOUNCIFY_API_KEY`
 
-### Test post used:
-```
-https://www.linkedin.com/posts/vihaarnandigala_we-built-something-a-little-dangerous-for-activity-7435067509197844481-ED9C
-```
+### Phase 4: Test endpoint
+- Added `POST /test/enrich` endpoint — accepts LinkedIn URLs, runs Ark AI + Bouncify, returns results
+- Created `test_enrichment.py` — standalone script that hits the test endpoint
+- This allows testing enrichment without going through the full Slack → PhantomBuster pipeline
 
 ---
 
 ## What needs to happen next
 
-### If Prospeo responds with a fix:
-1. Re-run `prospeo_test.py` with the same post URL to verify encoded URLs now work
-2. If enrichment rate jumps significantly, consider switching back to Prospeo (simpler — synchronous, no webhook complexity)
+### Step 1: Deploy and test Ark AI fixes
+1. Push code to GitHub (auto-deploys to Railway)
+2. Add `BOUNCIFY_API_KEY` to Railway environment variables
+3. Create a `urls.txt` file with ~50 LinkedIn profile URLs
+4. Run: `python test_enrichment.py urls.txt`
+5. Verify Ark AI webhooks arrive and emails are found
 
-### If Prospeo can't/won't fix it:
-1. Continue with Ark AI migration (Track 2 below)
-
-### Ark AI migration (Track 2 — unchanged from session 4):
-1. **TEST the current deployed code** — Drop a LinkedIn post URL in `#linkedin-scraper` and see if the webhook resend fallback works. The latest commit (f7484b1) is already deployed to Railway.
-2. **If it works** — Update STATUS.md and CLAUDE.md to mark as complete.
-3. **If webhook resend still fails** — Possible next steps:
-   - Check Railway logs for the resend response
-   - Try fetching results directly via Ark AI's "Find Emails by Track ID" endpoint as a secondary fallback
-   - Consider if Flask's single-threaded dev server is the issue — might need gunicorn with multiple workers
+### Step 2: Test full pipeline
+1. Drop a LinkedIn post URL in `#linkedin-scraper`
+2. Verify the complete pipeline runs end-to-end
 
 ---
 
-## What's working (unchanged)
+## What's working
 
 - PhantomBuster scraping (likers + commenters) — fully working
 - Ark AI export requests — correctly batched at 300 URLs
-- Ark AI webhook endpoint (`/webhook/ark`) — receives webhooks
-- Ark AI webhook resend fallback — deployed, **not yet tested**
+- Ark AI webhook endpoint (`/webhook/ark`) — receives webhooks + buffers pre-arrival data
+- Ark AI webhook resend fallback — deployed
+- Race condition fix — deployed, **not yet tested**
+- Gunicorn production server — deployed, **not yet tested**
+- Bouncify email validation — deployed, **not yet tested**
+- Test endpoint (`/test/enrich`) — deployed, **not yet tested**
 - Title filter — working
 - Instantly push — working
 - Slack bot — working
@@ -73,8 +70,7 @@ https://www.linkedin.com/posts/vihaarnandigala_we-built-something-a-little-dange
 
 ## What's NOT working (yet)
 
-- **Prospeo:** rejects 78% of LinkedIn URLs (encoded format). Emailed their team.
-- **Ark AI end-to-end:** has not completed successfully. Last test: 7 batches launched, 1 webhook arrived, batch 1 timed out. Resend fallback fix deployed but untested.
+- **Ark AI end-to-end:** has not completed successfully yet. Session 6 fixes (gunicorn + race condition) should resolve the webhook delivery issues. Needs testing.
 
 ---
 
@@ -86,13 +82,5 @@ https://www.linkedin.com/posts/vihaarnandigala_we-built-something-a-little-dange
 | 2 | 2026-02-19 | Deployed to Railway, Slack integration, fixed 4 bugs |
 | 3 | 2026-02-19/20 | Fixed corrupted phantom, sped up Prospeo, pipeline working end-to-end |
 | 4 | 2026-03-09 | Replaced Prospeo with Ark AI, deployed, 3 bugs found/fixed, not yet working |
-| 5 | 2026-03-10 | Diagnosed Prospeo issue (78% URLs rejected), emailed Prospeo team, waiting for response |
-
----
-
-## Git commits (sessions 4-5):
-1. `5db74db` — Replace Prospeo with Ark AI for email enrichment
-2. `f02557c` — Fix: add missing page field to Ark AI export request
-3. `a4678b6` — Fix: split Ark AI requests into batches of 300
-4. `f7484b1` — Fix: add webhook resend fallback when Ark AI webhook doesn't arrive
-5. `61c9ca1` — Update docs: session 4 status, bugs, lessons, Ark AI reference
+| 5 | 2026-03-10 | Diagnosed Prospeo issue (78% URLs rejected), emailed Prospeo team |
+| 6 | 2026-03-20 | Fixed Ark AI webhooks (gunicorn + race condition), added Bouncify, removed Prospeo, added test endpoint |

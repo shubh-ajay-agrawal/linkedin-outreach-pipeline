@@ -2,10 +2,11 @@
 
 A Slack bot that monitors `#linkedin-scraper` for LinkedIn post URLs and automatically:
 1. Scrapes all engagers from the post via PhantomBuster
-2. Enriches their details via Prospeo (verified emails only)
+2. Enriches their details via Ark AI (verified emails only)
 3. Filters leads by job title (decision-makers only)
-4. Pushes clean leads to an Instantly campaign
-5. Sends a summary back to Slack
+4. Validates emails through Bouncify (optional — skipped if no API key)
+5. Pushes clean leads to an Instantly campaign
+6. Sends a summary back to Slack
 
 ## Setup
 
@@ -20,10 +21,12 @@ Fill in every value:
 | Variable | Where to get it |
 |---|---|
 | `PHANTOMBUSTER_API_KEY` | PhantomBuster dashboard → API Keys |
-| `PROSPEO_API_KEY` | Prospeo dashboard → API |
+| `ARK_AI_API_KEY` | Ark AI dashboard → API settings |
 | `INSTANTLY_API_KEY` | Instantly → Settings → API → Generate Key |
 | `SLACK_BOT_TOKEN` | Slack API → Your App → OAuth & Permissions → Bot User OAuth Token (starts with `xoxb-`) |
 | `SLACK_SIGNING_SECRET` | Slack API → Your App → Basic Information → Signing Secret |
+| `BASE_URL` | Your Railway public URL (e.g. `https://web-production-e430.up.railway.app`) |
+| `BOUNCIFY_API_KEY` | *(Optional)* Bouncify dashboard → API key. If not set, email validation is skipped |
 
 ### 2. Create your Slack App
 
@@ -75,7 +78,7 @@ https://xxxx.ngrok.io/slack/events
 1. Push this repo to GitHub
 2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub Repo**
 3. Select this repository
-4. Go to **Variables** and add all 5 environment variables from your `.env`
+4. Go to **Variables** and add all environment variables from your `.env`
 5. Railway auto-detects the `Procfile` and deploys
 6. Copy your Railway public URL and update the Slack Event Subscription Request URL to:
    ```
@@ -96,7 +99,7 @@ The bot will scrape engagers, enrich emails, filter by title, push to Instantly,
 https://www.linkedin.com/posts/...
 
 👥 Engagers scraped: 127
-📧 Emails enriched by Prospeo: 89 (70%)
+📧 Emails enriched by Ark AI: 89 (70%)
 🎯 Passed title filter: 54
 🚫 Filtered out by title: 35
 ⏭️ Skipped (no email found): 38

@@ -1,8 +1,8 @@
 # CLAUDE.md — Project Context & Instructions
 
-## Project Status: ARK AI MIGRATION IN PROGRESS — NOT YET WORKING
+## Project Status: ARK AI FIXES + BOUNCIFY DEPLOYED — NEEDS TESTING
 
-Replaced Prospeo with Ark AI for email enrichment. Code is written and deployed but **not yet tested successfully end-to-end**. The Ark AI enrichment step has had 3 bugs so far (all fixed in code, deployed to Railway). The latest fix (webhook resend fallback) has NOT been tested yet. See STATUS.md for full details.
+Replaced Prospeo with Ark AI for email enrichment. Session 6 fixed the root causes of webhook failures (switched to gunicorn, fixed race condition). Added Bouncify as optional email validation. Added `/test/enrich` endpoint for isolated testing. **All deployed but not yet tested end-to-end.** See STATUS.md for full details.
 
 ---
 
@@ -25,7 +25,7 @@ A **LinkedIn outreach pipeline** that runs automatically via a Slack bot.
 ### The analogy:
 Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack channel (that's the coin). The machine automatically does 5 things and spits out a result (leads added to his email campaign + a summary in Slack).
 
-### The 5 things the machine does:
+### The 6 things the machine does:
 
 1. **Scrapes engagers** — Uses PhantomBuster (two phantoms: likers + commenters) to grab everyone who liked/commented on that LinkedIn post.
 
@@ -33,9 +33,11 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 
 3. **Filters by job title** — Only keeps decision-makers (founders, CEOs, VPs, directors). Drops students, interns, freelancers.
 
-4. **Pushes to email campaign** — Adds the clean leads to an Instantly email campaign so they get Shubh's outreach sequence.
+4. **Validates emails via Bouncify** — (Optional) Checks each email through Bouncify's API to guarantee deliverability. Only keeps "deliverable" emails. Skipped if `BOUNCIFY_API_KEY` is not set.
 
-5. **Reports back** — Sends a summary message to Slack with all the numbers.
+5. **Pushes to email campaign** — Adds the clean leads to an Instantly email campaign so they get Shubh's outreach sequence.
+
+6. **Reports back** — Sends a summary message to Slack with all the numbers.
 
 ---
 
@@ -49,8 +51,10 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 | Ark AI architecture | `threading.Event` bridges async webhook to synchronous pipeline | Pipeline thread waits on Event; Flask webhook handler signals it when results arrive. Shared state protected by `threading.Lock`. |
 | Instantly API version | v2 (`/api/v2/leads` with Bearer auth). **IMPORTANT: use `campaign` field, NOT `campaign_id`** | `campaign_id` is silently ignored. Must use `campaign`. |
 | Slack integration | Events API with URL verification | Standard for production, works with Railway |
+| Bouncify validation | Single-email `GET /v1/verify` with 0.5s delay | Simpler than bulk async. 50-200 leads after filtering takes 25-100 seconds. Gracefully skipped if no API key. |
+| Web server | gunicorn with 1 worker + 4 threads | Flask dev server dropped webhooks under load. 1 worker keeps shared memory; 4 threads handle concurrent requests. |
 | Deployment | Railway, auto-deploys from GitHub | Simple, reliable |
-| Web framework | Flask | Lightweight, perfect for a single webhook endpoint |
+| Web framework | Flask | Lightweight, perfect for webhook endpoints |
 
 ---
 
@@ -58,13 +62,14 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 
 | File | What it does |
 |---|---|
-| `main.py` | The front door. Listens for Slack messages, verifies they're real, spots LinkedIn URLs, kicks off the pipeline in a background thread, and receives Ark AI webhook callbacks at `/webhook/ark`. |
-| `pipeline.py` | The brain. Launches both PhantomBuster phantoms, polls for results, enriches via Ark AI (batch + webhook), filters by title, pushes to Instantly, sends Slack summary. |
+| `main.py` | The front door. Listens for Slack messages, verifies they're real, spots LinkedIn URLs, kicks off the pipeline in a background thread, receives Ark AI webhook callbacks at `/webhook/ark`, and serves the `/test/enrich` test endpoint. |
+| `pipeline.py` | The brain. Launches both PhantomBuster phantoms, polls for results, enriches via Ark AI (batch + webhook), validates via Bouncify, filters by title, pushes to Instantly, sends Slack summary. |
 | `title_filter.py` | The bouncer. Checks job titles and only lets decision-makers through. |
-| `.env` | API keys (filled in and working — all 5 keys verified). |
+| `test_enrichment.py` | Standalone test script. Sends LinkedIn URLs to `/test/enrich` endpoint, prints results + saves CSV. |
+| `.env` | API keys (filled in and working). |
 | `.env.example` | Template showing which API keys are needed. |
-| `requirements.txt` | Python packages: flask, requests, python-dotenv. |
-| `Procfile` | Tells Railway how to start the app (`web: python main.py`). |
+| `requirements.txt` | Python packages: flask, requests, python-dotenv, gunicorn. |
+| `Procfile` | Tells Railway how to start the app (`web: gunicorn ...`). |
 | `README.md` | Setup instructions. |
 
 ### Test files (can be deleted):
@@ -84,6 +89,7 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 - **Ark AI webhook timeout**: 15 minutes
 - **Ark AI statistics poll interval**: 30 seconds
 - **Instantly delay between calls**: 1 second
+- **Bouncify delay between calls**: 0.5 seconds
 - **Ark AI base URL**: `https://api.ai-ark.com/api/developer-portal/v1`
 
 ---
@@ -98,6 +104,7 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 | `SLACK_BOT_TOKEN` | Lets the bot read/send Slack messages | Slack app → OAuth & Permissions → Bot Token (starts with `xoxb-`) |
 | `SLACK_SIGNING_SECRET` | Verifies incoming requests are from Slack | Slack app → Basic Information → Signing Secret |
 | `BASE_URL` | The public URL of the Railway deployment (for Ark AI webhook) | Set to `https://web-production-e430.up.railway.app` |
+| `BOUNCIFY_API_KEY` | *(Optional)* Validates emails via Bouncify before pushing to Instantly | Bouncify dashboard → API key |
 
 ---
 
@@ -109,6 +116,7 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 - **Health check**: `/health` returns `{"status":"ok"}`
 - **Slack Events URL**: `https://web-production-e430.up.railway.app/slack/events`
 - **Ark AI Webhook URL**: `https://web-production-e430.up.railway.app/webhook/ark`
+- **Test Endpoint**: `POST https://web-production-e430.up.railway.app/test/enrich`
 - **Auto-deploy**: Railway auto-deploys when code is pushed to `main` branch on GitHub
 
 ---
@@ -141,7 +149,14 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 17. **New webhook endpoint** — Added `/webhook/ark` POST route to `main.py` that receives Ark AI results, stores them in shared dict, and signals the waiting pipeline thread.
 18. **Ark AI 400: missing `page` field** — First test returned `400 Bad Request`. Ark AI requires `"page": 0` in the export request body. **Fixed.**
 19. **Ark AI 400: batch size limit of 300** — Second test returned `400: contact.linkedin.any.include size must be less or equal than 300`. A viral post had 1,878 engagers. **Fixed by splitting URLs into batches of 300** — sends multiple export requests and waits for each webhook.
-20. **Ark AI webhook not received for batch 1** — Third test: 7 batches launched, one webhook arrived (for a later batch, trackId `ccfe7b5e-...`) but batch 1's webhook (trackId `5be63303-...`) never arrived within 15 minutes. **Fixed by adding webhook resend fallback** — if webhook times out, pipeline calls `PATCH /people/notify` to request Ark AI resend it, then waits 3 more minutes. **THIS FIX HAS NOT BEEN TESTED YET.**
+20. **Ark AI webhook not received for batch 1** — Third test: 7 batches launched, one webhook arrived (for a later batch, trackId `ccfe7b5e-...`) but batch 1's webhook (trackId `5be63303-...`) never arrived within 15 minutes. **Fixed by adding webhook resend fallback** — if webhook times out, pipeline calls `PATCH /people/notify` to request Ark AI resend it, then waits 3 more minutes.
+
+### Session 6 (2026-03-20) — Fix webhook reliability, add Bouncify, remove Prospeo:
+21. **Flask dev server dropping webhooks** — Flask's built-in Werkzeug server can't handle concurrent webhook requests reliably. When 7 batches send webhooks, some get dropped. **Fixed by switching to gunicorn** (1 worker + 4 threads). 1 worker keeps shared in-memory state working; 4 threads handle concurrent requests.
+22. **Race condition in event registration** — Pipeline sends POST to Ark AI, gets trackId, then registers `threading.Event`. If Ark AI processes fast and sends webhook before event is registered, webhook handler saw "No waiting pipeline" and silently dropped data. **Fixed by buffering results even without a registered event**, and checking for pre-arrived data after registration.
+23. **Added Bouncify email validation** — New optional step between title filter and Instantly push. Validates each email via Bouncify API. Gracefully skipped if `BOUNCIFY_API_KEY` not set. On API errors, keeps the lead.
+24. **Added `/test/enrich` endpoint** — Allows testing Ark AI + Bouncify without going through the full Slack → PhantomBuster pipeline. Accepts JSON list of LinkedIn URLs, returns enrichment results.
+25. **Removed Prospeo** — Deleted test files, updated README and docs. Prospeo is fully replaced by Ark AI.
 
 ---
 
@@ -156,6 +171,8 @@ Think of it like a vending machine. Shubh drops a LinkedIn post URL into a Slack
 | Ark AI webhook arrives but pipeline doesn't continue | `trackId` mismatch between request and webhook | Check Railway logs — the webhook log should show the trackId. Compare with the export request log |
 | Instantly shows errors | API key rotated or campaign deleted | Check Instantly settings for valid API key; verify campaign still exists |
 | Pipeline works but leads aren't in the campaign | Using `campaign_id` instead of `campaign` | Verify pipeline.py uses `"campaign"` field (not `"campaign_id"`) |
+| Bouncify rejects all emails | API key invalid or expired | Check Bouncify dashboard for valid API key and credit balance |
+| Bouncify step is skipped | `BOUNCIFY_API_KEY` not set | Add the key to Railway environment variables |
 
 ---
 
